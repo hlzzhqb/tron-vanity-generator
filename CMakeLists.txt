@@ -1,4 +1,10 @@
 cmake_minimum_required(VERSION 3.20)
+
+# 静态链接 MSVC 运行库，生成的 exe 不依赖 VC++ 运行时可再发行组件，方便复制到别的机器。
+# 必须在 project() 之前设策略，且要在 add_subdirectory(secp256k1) 之前，保证两边一致。
+set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)
+option(STATIC_RUNTIME "静态链接 C/C++ 运行库（便携 exe）" ON)
+
 project(tron_vanity_generator CXX)
 
 set(CMAKE_CXX_STANDARD 17)
@@ -6,6 +12,14 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+
+if(STATIC_RUNTIME)
+  if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+  else()
+    add_link_options(-static -static-libgcc -static-libstdc++)
+  endif()
 endif()
 
 # ---- libsecp256k1 (third_party/secp256k1, git submodule/clone) ----
@@ -45,7 +59,9 @@ find_package(Threads REQUIRED)
 target_link_libraries(tron_vanity_generator PRIVATE Threads::Threads)
 
 if(MSVC)
-  target_compile_options(tron_vanity_generator PRIVATE /O2 /EHsc /utf-8)
+  target_compile_options(tron_vanity_generator PRIVATE /EHsc /utf-8
+      $<$<CONFIG:Release>:/O2>)
 else()
-  target_compile_options(tron_vanity_generator PRIVATE -O3 -march=native)
+  # 不用 -march=native：便于把 exe 复制到 CPU 指令集不同的机器
+  target_compile_options(tron_vanity_generator PRIVATE -O3)
 endif()
