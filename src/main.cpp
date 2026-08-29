@@ -1,5 +1,6 @@
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstring>
@@ -17,7 +18,22 @@
 #include "crypto.h"
 #include "hwdetect.h"
 
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#endif
+
 namespace {
+
+// Windows 控制台：让 UTF-8 中文正常显示，并关闭 stdout 缓冲（否则输出会卡在缓冲区里，
+// 看起来像“只有光标在闪、没反应”）。
+void consoleInit() {
+#if defined(_WIN32)
+    SetConsoleOutputCP(CP_UTF8);
+#endif
+    std::cout << std::unitbuf;   // 每次 << 之后立即刷新
+    std::cerr << std::unitbuf;
+}
 
 RunState* gState = nullptr;
 
@@ -166,6 +182,7 @@ void gpuSetEcWindow(uint32_t w);
 void gpuSetMontN(uint32_t n);
 
 int main(int argc, char** argv) {
+    consoleInit();
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--selftest") return selftest();
@@ -222,10 +239,14 @@ int main(int argc, char** argv) {
         for (auto& l : bi.lines) std::cout << "       " << l << "\n";
 
         double rate = 0.0;
+        if (bi.kind == "GPU" && (opt.backend == "gpu" || opt.backend == "auto"))
+            std::cout << "       (首次准备 GPU：编译 OpenCL 内核，约需数秒...)\n";
         bool ok = b->available();
         if (!ok) {
             std::cout << "       [" << b->note() << "]\n";
         } else if (doBench) {
+            std::cout << "       (压测算力 ~" << (opt.benchSeconds * (bi.kind == "GPU" ? 1.6 : 1.0))
+                      << "s...)\n";
             rate = b->benchmark(opt.benchSeconds);
             std::cout << "       " << keysPerSec(rate) << "\n";
         }
@@ -277,10 +298,19 @@ int main(int argc, char** argv) {
     gState = &state;
     std::signal(SIGINT, onSigint);
 
+    double rate = chosenRate > 0 ? chosenRate : (chosen->info().kind == "GPU" ? 700000.0 : 250000.0);
+    // 命中 minLen 位相同/连续尾号的粗略概率（相同 + 递增 + 递减）
+    double p = 3.0 * std::pow(1.0 / 58.0, opt.minLen - 1);
+    double etaSec = p > 0 ? 1.0 / (rate * p) : 0;
+
     std::cout << "最小位数 : " << opt.minLen << "\n"
               << "输出文件 : " << opt.output << "\n"
-              << "尝试上限 : " << (opt.maxAttempts ? groupThousands(opt.maxAttempts) : "无限") << "\n"
-              << "按 Ctrl+C 停止。\n\n";
+              << "尝试上限 : " << (opt.maxAttempts ? groupThousands(opt.maxAttempts) : "无限") << "\n";
+    if (etaSec > 0)
+        std::cout << "预计每命中一个约需 " << (etaSec < 90 ? std::to_string((long)etaSec) + " 秒"
+                     : etaSec < 5400 ? std::to_string((long)(etaSec / 60)) + " 分钟"
+                     : std::to_string((long)(etaSec / 3600)) + " 小时") << "\n";
+    std::cout << "运行中，每 10 秒报告一次进度。按 Ctrl+C 停止。\n\n";
 
     FileSink sink(opt.output);
     ReportFn report = [&sink](const FoundKey& fk) { sink(fk); };
@@ -288,18 +318,18 @@ int main(int argc, char** argv) {
     std::atomic<bool> done{false};
     auto start = std::chrono::steady_clock::now();
 
-    const int reportEvery = opt.verbose ? 5 : 30;
+    const int reportEvery = opt.verbose ? 5 : 10;
     std::thread progress([&] {
-        int elapsed = 0;
+        int ticks = 0;
         while (!done.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
             if (done.load()) break;
-            if (++elapsed % (reportEvery * 4) != 0) continue;
+            if (++ticks % (reportEvery * 4) != 0) continue;
             double el = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - start).count();
             uint64_t c = state.checked.load();
-            std::cout << "已检查 " << groupThousands(c) << " (" << keysPerSec(el > 0 ? c / el : 0)
-                      << ")，命中 " << state.found.load() << "\n";
+            std::cout << "[" << (long)el << "s] 已检查 " << groupThousands(c) << " ("
+                      << keysPerSec(el > 0 ? c / el : 0) << ")，命中 " << state.found.load() << "\n";
         }
     });
 
