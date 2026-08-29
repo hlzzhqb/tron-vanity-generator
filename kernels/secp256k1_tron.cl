@@ -412,6 +412,50 @@ inline void ge_load_g(ge *p, __global const uchar *xy) {
     p->inf = 0;
 }
 
+/* ---------------- 固定基点标量乘 ----------------
+ * ECW = 窗口位宽；ECBITS = base 的有效位数（= log2(每次内核扫描的私钥数）
+ *   ECW==1 : table[j] (j=0..31) = 2^j * G，逐 bit（baseline）
+ *   ECW>=2 : table[w*(1<<ECW) + d] = d * 2^(w*ECW) * G，comb 窗口法
+ * 窗口法把点加次数从 ~ECBITS/2 降到 ceil(ECBITS/ECW)。
+ */
+#ifndef ECW
+#define ECW 1
+#endif
+#ifndef ECBITS
+#define ECBITS 20
+#endif
+#define ECW_DIGITS (1 << ECW)
+#define ECW_WINDOWS ((ECBITS + ECW - 1) / ECW)
+
+inline void ec_base_mul(gej *acc, const ge *P0, __global const uchar *table_b32, uint base) {
+    gej_from_ge(acc, P0);
+#if ECW == 1
+    for (int j = 0; j < 32; j++) {
+        if ((base >> j) & 1u) {
+            ge tj; ge_load_g(&tj, &table_b32[j * 64]);
+            gej_add_ge(acc, acc, &tj);
+        }
+    }
+#else
+    for (int w = 0; w < ECW_WINDOWS; w++) {
+        uint d = (base >> (w * ECW)) & (ECW_DIGITS - 1);
+        if (d) {
+            ge tj; ge_load_g(&tj, &table_b32[(w * ECW_DIGITS + d) * 64]);
+            gej_add_ge(acc, acc, &tj);
+        }
+    }
+#endif
+}
+
+/* 生成器 G 在表中的位置 */
+inline void ec_load_G(ge *G, __global const uchar *table_b32) {
+#if ECW == 1
+    ge_load_g(G, &table_b32[0 * 64]);          /* 2^0 * G */
+#else
+    ge_load_g(G, &table_b32[1 * 64]);          /* w=0,d=1 -> 1 * G */
+#endif
+}
+
 /* ---------------- keccak-256 ---------------- */
 
 __constant ulong KECCAK_RC[24] = {
@@ -595,19 +639,11 @@ __kernel void tron_vanity_probe(
     uint gid = get_global_id(0);
     uint base = gid * KPI;
 
-    ge Gpt; ge_load_g(&Gpt, &table_b32[0]);   /* table[0] = G */
+    ge Gpt; ec_load_G(&Gpt, table_b32);
     ge P0;  ge_load_g(&P0, &P0_b32[0]);
 
-    /* acc = P0 + base*G （一次标量乘，随后逐个 +G 增量推进） */
     gej acc;
-    gej_from_ge(&acc, &P0);
-    for (int j = 0; j < 32; j++) {
-        if ((base >> j) & 1u) {
-            ge tj;
-            ge_load_g(&tj, &table_b32[j * 64]);
-            gej_add_ge(&acc, &acc, &tj);
-        }
-    }
+    ec_base_mul(&acc, &P0, table_b32, base);   /* acc = P0 + base*G */
 
     #pragma unroll 1
     for (uint i = 0; i < KPI; i++) {
@@ -631,11 +667,9 @@ __kernel void prof(__global const uchar *P0_b32,
     uint gid = get_global_id(0);
     uint base = gid * KPI;
 
-    ge Gpt; ge_load_g(&Gpt, &table_b32[0]);
+    ge Gpt; ec_load_G(&Gpt, table_b32);
     ge P0;  ge_load_g(&P0, &P0_b32[0]);
-    gej acc; gej_from_ge(&acc, &P0);
-    for (int j = 0; j < 32; j++)
-        if ((base >> j) & 1u) { ge tj; ge_load_g(&tj, &table_b32[j*64]); gej_add_ge(&acc, &acc, &tj); }
+    gej acc; ec_base_mul(&acc, &P0, table_b32, base);
 
     uint sv = 0;
     #pragma unroll 1

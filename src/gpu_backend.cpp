@@ -18,11 +18,15 @@
 namespace {
 
 constexpr uint32_t kBatch = 1u << 20;   // 每次内核启动扫描的连续私钥数
+constexpr uint32_t kEcBits = 20;        // = log2(kBatch)，固定基点标量乘的有效位数
 constexpr uint32_t kOutCap = 8192;      // 单批命中回传上限
 
 // 每个 work-item 连续处理多少私钥。UHD 730 上实测 N=1 最快（寄存器压力 + 每个私钥仍需一次
 // 模逆，未做 Montgomery 批量求逆）。保留可调，供不同 GPU 找甜点位。
 uint32_t g_keysPerItem = 1;
+// 固定基点窗口位宽：1=逐bit(baseline)。UHD 730 实测 ECW=7 甜点位（3 次点加，24KB 表，
+// 约 +58%），再大表翻倍收益 <1%。换 GPU 可用 --bench 重新找。
+uint32_t g_ecWindow = 7;
 
 bool pubXY(secp256k1_context* c, const unsigned char sk[32], unsigned char out64[64]) {
     secp256k1_pubkey p;
@@ -40,6 +44,31 @@ void scalarBE(uint32_t s, unsigned char out[32]) {
     out[29] = static_cast<unsigned char>(s >> 16);
     out[30] = static_cast<unsigned char>(s >> 8);
     out[31] = static_cast<unsigned char>(s);
+}
+
+// 生成固定基点预计算表
+std::vector<unsigned char> genTable(secp256k1_context* c, uint32_t ecw) {
+    std::vector<unsigned char> t;
+    if (ecw <= 1) {
+        t.assign(32 * 64, 0);
+        for (int j = 0; j < 32; ++j) {
+            unsigned char sk[32] = {0};
+            sk[31 - j / 8] = static_cast<unsigned char>(1u << (j % 8));
+            pubXY(c, sk, &t[j * 64]);
+        }
+        return t;
+    }
+    uint32_t digits = 1u << ecw;
+    uint32_t windows = (kEcBits + ecw - 1) / ecw;
+    t.assign(static_cast<size_t>(windows) * digits * 64, 0);
+    for (uint32_t w = 0; w < windows; ++w)
+        for (uint32_t d = 1; d < digits; ++d) {
+            uint64_t scalar = static_cast<uint64_t>(d) << (w * ecw);
+            unsigned char sk[32] = {0};
+            for (int b = 0; b < 8; ++b) sk[31 - b] = static_cast<unsigned char>(scalar >> (8 * b));
+            pubXY(c, sk, &t[(static_cast<size_t>(w) * digits + d) * 64]);
+        }
+    return t;
 }
 
 class GpuBackend : public Backend {
@@ -124,8 +153,9 @@ private:
     ocl::Program prog_;
     ocl::id kProbe_ = nullptr;
     ocl::id bufTable_ = nullptr, bufP0_ = nullptr, bufCount_ = nullptr, bufOutS_ = nullptr;
-    std::vector<unsigned char> table_;   // 32 * 64
-    uint32_t builtKpi_ = 8;
+    std::vector<unsigned char> table_;
+    uint32_t builtKpi_ = 1;
+    uint32_t builtEcw_ = 1;
 
     bool ensureReady() {
         if (tried_) return ready_;
@@ -134,18 +164,15 @@ private:
         if (!hw_.deviceId) { err_ = "无 OpenCL 设备句柄"; return false; }
         builtKpi_ = g_keysPerItem ? g_keysPerItem : 1;
         while (kBatch % builtKpi_) --builtKpi_;
-        std::string opts = "-D KPI=" + std::to_string(builtKpi_);
+        builtEcw_ = g_ecWindow ? g_ecWindow : 1;
+        std::string opts = "-D KPI=" + std::to_string(builtKpi_) +
+                           " -D ECW=" + std::to_string(builtEcw_) +
+                           " -D ECBITS=" + std::to_string(kEcBits);
         if (!prog_.build(hw_.platformId, hw_.deviceId, kGpuKernelSource, opts, &err_)) return false;
         kProbe_ = prog_.kernel("tron_vanity_probe", &err_);
         if (!kProbe_) return false;
 
-        // 预计算表 T[j] = 2^j * G
-        table_.assign(32 * 64, 0);
-        for (int j = 0; j < 32; ++j) {
-            unsigned char sk[32] = {0};
-            sk[31 - j / 8] = static_cast<unsigned char>(1u << (j % 8));
-            if (!pubXY(ctx_, sk, &table_[j * 64])) { err_ = "预计算表生成失败"; return false; }
-        }
+        table_ = genTable(ctx_, builtEcw_);
         bufTable_ = prog_.buffer(ocl::MEM_READ_ONLY | ocl::MEM_COPY_HOST_PTR, table_.size(), table_.data(), &err_);
         bufP0_ = prog_.buffer(ocl::MEM_READ_ONLY, 64, nullptr, &err_);
         bufCount_ = prog_.buffer(ocl::MEM_READ_WRITE, 4, nullptr, &err_);
@@ -259,6 +286,7 @@ std::unique_ptr<Backend> makeGpuBackend(const GpuDevice& dev) {
 int gpuSelfTest(const GpuDevice& dev) { return GpuBackend::selfTest(dev); }
 
 void gpuSetKeysPerItem(uint32_t n) { if (n) g_keysPerItem = n; }
+void gpuSetEcWindow(uint32_t w) { if (w >= 1 && w <= 8) g_ecWindow = w; }
 
 // --profile：逐阶段消融，估算内核各阶段占比
 int gpuProfile(const GpuDevice& dev, double secs) {
@@ -266,28 +294,26 @@ int gpuProfile(const GpuDevice& dev, double secs) {
     if (!ocl::load(&err)) { std::cout << err << "\n"; return 1; }
     secp256k1_context* c = secp256k1_context_create(SECP256K1_CONTEXT_NONE);
 
-    std::vector<unsigned char> table(32 * 64, 0);
-    for (int j = 0; j < 32; ++j) {
-        unsigned char sk[32] = {0};
-        sk[31 - j / 8] = static_cast<unsigned char>(1u << (j % 8));
-        pubXY(c, sk, &table[j * 64]);
-    }
+    uint32_t ecw = g_ecWindow ? g_ecWindow : 1;
+    std::vector<unsigned char> table = genTable(c, ecw);
     unsigned char k0[32], p0[64];
     do { randBytes(k0, 32); } while (!pubXY(c, k0, p0));
 
     const uint32_t kb = 1u << 20;
-    const char* names[7] = { "", "EC 标量乘 (<=32 点加)", "模逆 + 转仿射", "Keccak-256",
+    const char* names[7] = { "", "EC 标量乘 (固定基点窗口法)", "模逆 + 转仿射", "Keccak-256",
                              "SHA-256d (校验和)", "Base58 尾部", "尾号匹配" };
     double nsPerKey[7] = {0};
 
     double hostNs = 0;
 
-    std::cout << "\n== TRON GPU Profile (" << dev.name << ", KPI=1) ==\n"
+    std::cout << "\n== TRON GPU Profile (" << dev.name << ", KPI=1, ECW=" << ecw << ") ==\n"
               << "逐阶段消融：每阶段单独编译内核，预热到稳态后计时。\n\n";
 
     for (int stage = 1; stage <= 6; ++stage) {
         ocl::Program p;
-        std::string opts = "-D KPI=1 -D PROF_STAGE=" + std::to_string(stage);
+        std::string opts = "-D KPI=1 -D ECW=" + std::to_string(ecw) +
+                           " -D ECBITS=" + std::to_string(kEcBits) +
+                           " -D PROF_STAGE=" + std::to_string(stage);
         if (!p.build(dev.platformId, dev.deviceId, kGpuKernelSource, opts, &err)) {
             std::cout << "stage " << stage << " 编译失败:\n" << err << "\n";
             return 1;
@@ -359,26 +385,49 @@ int gpuProfile(const GpuDevice& dev, double secs) {
     return 0;
 }
 
-// --bench：扫 keys-per-item 甜点位 + 按尾号位数看吞吐（每个 N 重新编译内核以获得展开优化）
+// --bench：EC 窗口法 × keys-per-item 矩阵 + 尾号规则吞吐
+// 每档单独编译内核、重新生成预计算表，预热到稳态再计时。
 int gpuBench(const GpuDevice& dev, double secs) {
     std::cout << "\n每档预热 " << secs << "s + 计时 " << secs
-              << "s（集成显卡持续负载会降频，取计时段的稳态值）\n";
-    std::cout << "\n== keys-per-item 扫描（纯吞吐，min_len=20）==\n";
-    uint32_t bestN = 8;
+              << "s（集成显卡持续负载会降频，取稳态值）\n";
+
+    uint32_t savedKpi = g_keysPerItem, savedEcw = g_ecWindow;
+
+    std::cout << "\n== 固定基点 EC 窗口法扫描（KPI=1，min_len=20）==\n";
+    std::cout << "  ECW=1 逐bit(baseline)；ECW=w 用 comb 表，点加从 ~10 降到 ceil(20/w)\n";
+    g_keysPerItem = 1;
+    uint32_t bestEcw = 1;
     double bestR = 0;
-    for (uint32_t n : {1u, 2u, 4u, 8u, 16u, 32u, 64u}) {
+    double baseR = 0;
+    for (uint32_t w : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u}) {
+        g_ecWindow = w;
+        GpuBackend b(dev);
+        if (!b.available()) { std::cout << "  ECW=" << w << " 构建失败\n"; continue; }
+        b.benchN(secs, 20);
+        double r = b.benchN(secs, 20);
+        if (w == 1) baseR = r;
+        uint32_t windows = (kEcBits + w - 1) / w;
+        uint32_t kb = (w == 1 ? 2u : windows * (1u << w) * 64 / 1024);
+        std::printf("  ECW=%u  (窗口 %u, 表 %3u KB) : %10.0f keys/s   %+5.0f%%%s\n",
+                    w, windows, kb, r, baseR > 0 ? (r - baseR) / baseR * 100 : 0,
+                    r > bestR ? "  <-" : "");
+        if (r > bestR) { bestR = r; bestEcw = w; }
+    }
+    std::printf("  最优 ECW=%u  (%.0f keys/s)\n", bestEcw, bestR);
+
+    std::cout << "\n== keys-per-item 扫描 (ECW=" << bestEcw << ") ==\n";
+    g_ecWindow = bestEcw;
+    for (uint32_t n : {1u, 2u, 4u, 8u, 16u}) {
         g_keysPerItem = n;
         GpuBackend b(dev);
-        if (!b.available()) { std::cout << "  N=" << n << " 构建失败\n"; continue; }
-        b.benchN(secs, 20);                     // 预热（降频到稳态）
-        double r = b.benchN(secs, 20);          // 计时
-        std::printf("  N=%-3u : %10.0f keys/s%s\n", n, r, r > bestR ? "  <-" : "");
-        if (r > bestR) { bestR = r; bestN = n; }
+        if (!b.available()) continue;
+        b.benchN(secs, 20);
+        double r = b.benchN(secs, 20);
+        std::printf("  N=%-3u : %10.0f keys/s\n", n, r);
     }
-    std::printf("  甜点位 N=%u  (%.0f keys/s)\n", bestN, bestR);
 
-    std::cout << "\n== 尾号规则对吞吐的影响 (N=" << bestN << ") ==\n";
-    g_keysPerItem = bestN;
+    std::cout << "\n== 尾号规则对吞吐的影响 (ECW=" << bestEcw << ", N=1) ==\n";
+    g_keysPerItem = 1;
     GpuBackend b(dev);
     b.available();
     b.benchN(secs, 5);
@@ -386,5 +435,8 @@ int gpuBench(const GpuDevice& dev, double secs) {
         double r = b.benchN(secs, ml);
         std::printf("  相同/连续 >= %u 位 : %10.0f keys/s\n", ml, r);
     }
+
+    g_keysPerItem = savedKpi;
+    g_ecWindow = savedEcw;
     return 0;
 }

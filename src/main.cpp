@@ -32,7 +32,8 @@ struct Options {
     std::string output = "tron_vanity_matches.txt";
     std::string backend = "auto";   // auto | cpu | gpu
     double benchSeconds = 2.0;
-    uint32_t keysPerItem = 1;       // GPU: 每 work-item 处理的私钥数（0=不改默认）
+    uint32_t keysPerItem = 1;       // GPU: 每 work-item 处理的私钥数
+    uint32_t ecWindow = 0;          // GPU: 固定基点窗口位宽（0=用内置默认）
     bool verbose = false;
     bool listOnly = false;
 };
@@ -48,7 +49,8 @@ void printUsage() {
         "  --output FILE    结果文件，默认 tron_vanity_matches.txt\n"
         "  --backend X      auto | cpu | gpu，默认 auto (按压测算力自动选择)\n"
         "  --bench-seconds S 自动选择时每个后端的压测秒数，默认 2\n"
-        "  --keys-per-item N GPU 每个 work-item 连续处理的私钥数，默认 8\n"
+        "  --keys-per-item N GPU 每个 work-item 连续处理的私钥数，默认 1\n"
+        "  --ec-window N     GPU 固定基点窗口位宽 (1=逐bit, 2..6=comb)，默认 1\n"
         "  --verbose        输出进度\n"
         "  --list           只打印硬件检测结果后退出\n"
         "  --bench [秒]     GPU 压测：扫 keys-per-item 甜点位 + 各尾号规则吞吐\n"
@@ -72,6 +74,7 @@ bool parseArgs(int argc, char** argv, Options& o) {
         else if (a == "--backend") o.backend = next("--backend");
         else if (a == "--bench-seconds") o.benchSeconds = std::stod(next("--bench-seconds"));
         else if (a == "--keys-per-item") o.keysPerItem = static_cast<uint32_t>(std::stoul(next("--keys-per-item")));
+        else if (a == "--ec-window") o.ecWindow = static_cast<uint32_t>(std::stoul(next("--ec-window")));
         else if (a == "--verbose") o.verbose = true;
         else if (a == "--list") o.listOnly = true;
         else if (a == "--help" || a == "-h") { printUsage(); return false; }
@@ -156,6 +159,7 @@ int gpuSelfTest(const GpuDevice& dev);
 int gpuBench(const GpuDevice& dev, double secs);
 int gpuProfile(const GpuDevice& dev, double secs);
 void gpuSetKeysPerItem(uint32_t n);
+void gpuSetEcWindow(uint32_t w);
 
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; ++i) {
@@ -180,6 +184,7 @@ int main(int argc, char** argv) {
     if (!parseArgs(argc, argv, opt)) return 0;
 
     gpuSetKeysPerItem(opt.keysPerItem);
+    gpuSetEcWindow(opt.ecWindow);
     HardwareReport hw = detectHardware();
 
     // 候选后端
