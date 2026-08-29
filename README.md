@@ -25,11 +25,24 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 - SHA-256 已内置（`src/crypto.cpp`），随机数用 Windows `BCryptGenRandom`
 - 无需 OpenSSL
 
-也可手动：
-```powershell
-cmake -B build -G Ninja
-cmake --build build --config Release
-```
+## 复制到另一台机器运行
+
+生成的 exe **静态链接运行库**，只依赖 `KERNEL32.dll` + `bcrypt.dll`（Win10/11 自带），
+不需要装 VC++ 运行时。内核已嵌进 exe，secp256k1 也静态链接。
+
+**方式 A — 只拷 exe（最快，目标机也是 64 位 Windows）**
+1. 把 `build\tron_vanity_generator.exe` 拷到目标机任意目录
+2. 直接运行。`--backend cpu` / `auto` 立即可用
+3. 想用 GPU：目标机需装 Intel/AMD 显卡驱动（自带 `OpenCL.dll`）。没有就自动回退 CPU
+4. 到目标机先跑一次 `tron_vanity_generator.exe --selftest` 和 `--gputest` 确认无误
+
+**方式 B — 拷源码在目标机重新编译**
+1. 拷整个文件夹（`build\` 和 `third_party\` 可不拷）
+2. 目标机装 Visual Studio 2022/2026 或 Build Tools（勾选“使用 C++ 的桌面开发”）+ git
+3. `powershell -ExecutionPolicy Bypass -File build.ps1`（联网，会自动 clone secp256k1）
+   - 无网络时：先在有网机器 `git clone --depth 1 https://github.com/bitcoin-core/secp256k1 third_party/secp256k1`，连 `third_party\` 一起拷过去
+
+私钥文件（`tron_vanity_matches.txt`）是明文，拷贝/传输时注意安全。
 
 ## 使用
 
