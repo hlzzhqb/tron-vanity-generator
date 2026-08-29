@@ -598,40 +598,94 @@ inline int tail_match_len(const uchar *tp) {
 
 /* ---------------- 主内核 ---------------- */
 
-/* acc 已是 P0 + s*G，判定其地址尾号；命中则回传 s */
-inline void probe_one(gej *acc, uint s, uint min_len,
-                      volatile __global uint *out_count,
-                      __global uint *out_s, uint out_cap) {
-    uchar pub[64];
-    gej_to_pub(pub, acc);
-
+/* pub = X||Y (64B 大端)。算 TRON 地址结尾 TAIL 个 base58 位置。 */
+inline void pub_to_tail(const uchar *pub, uchar *tp) {
     uchar h[32];
     keccak256_64(h, pub);
-
     uchar payload[21];
     payload[0] = 0x41;
     for (int i = 0; i < 20; i++) payload[1 + i] = h[12 + i];
-
     uchar d1[32], d2[32];
     sha256_short(d1, payload, 21);
     sha256_short(d2, d1, 32);
-
     uchar full[25];
     for (int i = 0; i < 21; i++) full[i] = payload[i];
     for (int i = 0; i < 4; i++) full[21 + i] = d2[i];
-
-    uchar tp[TAIL];
     base58_tail_pos(tp, full);
+}
 
+inline void emit_if_match(const uchar *pub, uint s, uint min_len,
+                          volatile __global uint *out_count,
+                          __global uint *out_s, uint out_cap) {
+    uchar tp[TAIL];
+    pub_to_tail(pub, tp);
     if ((uint)tail_match_len(tp) >= min_len) {
         uint idx = atomic_inc(out_count);
         if (idx < out_cap) out_s[idx] = s;
     }
 }
 
+inline void probe_one(gej *acc, uint s, uint min_len,
+                      volatile __global uint *out_count,
+                      __global uint *out_s, uint out_cap) {
+    uchar pub[64];
+    gej_to_pub(pub, acc);
+    emit_if_match(pub, s, min_len, out_count, out_s, out_cap);
+}
+
+/* fe <-> __local uint[10] */
+inline void fe_ld_l(fe *r, __local const uint *p) { for (int i = 0; i < 10; i++) r->n[i] = p[i]; }
+inline void fe_st_l(__local uint *p, const fe *a) { for (int i = 0; i < 10; i++) p[i] = a->n[i]; }
+
+/* Jacobian (X,Y) + 已求逆的 z^-1 -> 仿射 pub 64B 大端 */
+inline void jac_to_pub(uchar *pub, const fe *X, const fe *Y, const fe *zi) {
+    fe z2, z3, x, y;
+    fe_sqr(&z2, zi);
+    fe_mul(&z3, zi, &z2);
+    fe_mul(&x, X, &z2);
+    fe_mul(&y, Y, &z3);
+    fe_normalize(&x);
+    fe_normalize(&y);
+    fe_get_b32(&pub[0], &x);
+    fe_get_b32(&pub[32], &y);
+}
+
+#ifndef MONT_N
+#define MONT_N 1
+#endif
+
+/* Montgomery 批量求逆：zbuf 存 N 个 Z，出口 zinv 存 N 个 z^-1。所有 WI 必须都调用。 */
+inline void mont_batch_invert(__local uint *zbuf, __local uint *zinv, int lid) {
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lid == 0) {
+        fe prod, zt;
+        fe_ld_l(&prod, &zbuf[0]);
+        fe_st_l(&zinv[0], &prod);
+        for (int i = 1; i < MONT_N; i++) {
+            fe_ld_l(&zt, &zbuf[i * 10]);
+            fe_mul(&prod, &prod, &zt);
+            fe_st_l(&zinv[i * 10], &prod);
+        }
+        fe inv;
+        fe_inv(&inv, &prod);
+        for (int i = MONT_N - 1; i >= 1; i--) {
+            fe pre, t;
+            fe_ld_l(&pre, &zinv[(i - 1) * 10]);
+            fe_mul(&t, &inv, &pre);
+            fe_ld_l(&zt, &zbuf[i * 10]);
+            fe_mul(&inv, &inv, &zt);
+            fe_st_l(&zinv[i * 10], &t);
+        }
+        fe_st_l(&zinv[0], &inv);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+}
+
+#if MONT_N <= 1
+
 __kernel void tron_vanity_probe(
-        __global const uchar *P0_b32,     /* 64 字节: X||Y 大端 */
-        __global const uchar *table_b32,  /* 32 * 64 字节: 每个 2^j*G 的 X||Y 大端 */
+        __global const uchar *P0_b32,
+        __global const uchar *table_b32,
         const uint min_len,
         volatile __global uint *out_count,
         __global uint *out_s,
@@ -643,14 +697,46 @@ __kernel void tron_vanity_probe(
     ge P0;  ge_load_g(&P0, &P0_b32[0]);
 
     gej acc;
-    ec_base_mul(&acc, &P0, table_b32, base);   /* acc = P0 + base*G */
+    ec_base_mul(&acc, &P0, table_b32, base);
 
     #pragma unroll 1
     for (uint i = 0; i < KPI; i++) {
         probe_one(&acc, base + i, min_len, out_count, out_s, out_cap);
-        gej_add_ge(&acc, &acc, &Gpt);   /* acc += G */
+        gej_add_ge(&acc, &acc, &Gpt);
     }
 }
+
+#else  /* Montgomery 批量求逆：1 work-item = 1 私钥 = 1 Jacobian 点，work-group 内 N 个一起求逆 */
+
+__kernel __attribute__((reqd_work_group_size(MONT_N, 1, 1)))
+void tron_vanity_probe(
+        __global const uchar *P0_b32,
+        __global const uchar *table_b32,
+        const uint min_len,
+        volatile __global uint *out_count,
+        __global uint *out_s,
+        const uint out_cap) {
+    uint gid = get_global_id(0);
+    uint lid = get_local_id(0);
+    uint s = gid;
+
+    ge P0; ge_load_g(&P0, &P0_b32[0]);
+    gej acc;
+    ec_base_mul(&acc, &P0, table_b32, s);        /* 本 WI 唯一的 Jacobian 点 */
+
+    __local uint zbuf[MONT_N * 10];
+    __local uint zinv[MONT_N * 10];
+    fe_st_l(&zbuf[lid * 10], &acc.z);
+    mont_batch_invert(zbuf, zinv, lid);
+
+    fe zi;
+    fe_ld_l(&zi, &zinv[lid * 10]);
+    uchar pub[64];
+    jac_to_pub(pub, &acc.x, &acc.y, &zi);
+    emit_if_match(pub, s, min_len, out_count, out_s, out_cap);
+}
+
+#endif
 
 /* ---------------- 分阶段 profile 内核 ----------------
  * host 用 -D PROF_STAGE=1..6 各编译一次，逐阶段消融测吞吐；
@@ -729,3 +815,32 @@ __kernel void test_pub(
     gej_to_pub(pub, &acc);
     for (int i = 0; i < 64; i++) pubout[gid * 64 + i] = pub[i];
 }
+
+#if MONT_N > 1
+/* 批量求逆版：work-group=MONT_N，用 ec_base_mul(ECW) 算点，Montgomery 一次求逆，输出 pub。
+ * host 对照 test_pub（逐点单独求逆）与 libsecp256k1，验证 batch inverse 数学一致。
+ * scalars[gid] 必须 < 2^ECBITS。 */
+__kernel __attribute__((reqd_work_group_size(MONT_N, 1, 1)))
+void test_mont(__global const uchar *P0_b32,
+               __global const uchar *table_b32,
+               __global const uint *scalars,
+               __global uchar *pubout,
+               const uint n) {
+    uint gid = get_global_id(0);
+    uint lid = get_local_id(0);
+    uint s = (gid < n) ? scalars[gid] : 0;
+
+    ge P0; ge_load_g(&P0, &P0_b32[0]);
+    gej acc; ec_base_mul(&acc, &P0, table_b32, s);
+
+    __local uint zbuf[MONT_N * 10];
+    __local uint zinv[MONT_N * 10];
+    fe_st_l(&zbuf[lid * 10], &acc.z);
+    mont_batch_invert(zbuf, zinv, lid);
+
+    fe zi; fe_ld_l(&zi, &zinv[lid * 10]);
+    uchar pub[64];
+    jac_to_pub(pub, &acc.x, &acc.y, &zi);
+    if (gid < n) for (int i = 0; i < 64; i++) pubout[gid * 64 + i] = pub[i];
+}
+#endif

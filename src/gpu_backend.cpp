@@ -27,6 +27,9 @@ uint32_t g_keysPerItem = 1;
 // 固定基点窗口位宽：1=逐bit(baseline)。UHD 730 实测 ECW=7 甜点位（3 次点加，24KB 表，
 // 约 +58%），再大表翻倍收益 <1%。换 GPU 可用 --bench 重新找。
 uint32_t g_ecWindow = 7;
+// Montgomery 批量求逆的 work-group 大小：1=每 WI 各自求逆（v0.2）。>=2=work-group 内 N 个点
+// 共用一次模逆。用 --bench 找甜点位。
+uint32_t g_montN = 1;
 
 bool pubXY(secp256k1_context* c, const unsigned char sk[32], unsigned char out64[64]) {
     secp256k1_pubkey p;
@@ -156,18 +159,21 @@ private:
     std::vector<unsigned char> table_;
     uint32_t builtKpi_ = 1;
     uint32_t builtEcw_ = 1;
+    uint32_t builtMont_ = 1;
 
     bool ensureReady() {
         if (tried_) return ready_;
         tried_ = true;
         if (!ocl::load(&err_)) return false;
         if (!hw_.deviceId) { err_ = "无 OpenCL 设备句柄"; return false; }
-        builtKpi_ = g_keysPerItem ? g_keysPerItem : 1;
+        builtMont_ = g_montN >= 2 ? g_montN : 1;
+        builtKpi_ = builtMont_ >= 2 ? 1 : (g_keysPerItem ? g_keysPerItem : 1);
         while (kBatch % builtKpi_) --builtKpi_;
         builtEcw_ = g_ecWindow ? g_ecWindow : 1;
         std::string opts = "-D KPI=" + std::to_string(builtKpi_) +
                            " -D ECW=" + std::to_string(builtEcw_) +
-                           " -D ECBITS=" + std::to_string(kEcBits);
+                           " -D ECBITS=" + std::to_string(kEcBits) +
+                           " -D MONT_N=" + std::to_string(builtMont_);
         if (!prog_.build(hw_.platformId, hw_.deviceId, kGpuKernelSource, opts, &err_)) return false;
         kProbe_ = prog_.kernel("tron_vanity_probe", &err_);
         if (!kProbe_) return false;
@@ -195,7 +201,8 @@ private:
         uint32_t zero = 0;
         if (!prog_.write(bufCount_, 4, &zero)) return false;
 
-        uint32_t global = kBatch / builtKpi_;
+        uint32_t global = builtMont_ >= 2 ? kBatch : kBatch / builtKpi_;
+        size_t local = builtMont_ >= 2 ? builtMont_ : 0;
         if (!prog_.setArg(kProbe_, 0, sizeof(ocl::id), &bufP0_)) return false;
         prog_.setArg(kProbe_, 1, sizeof(ocl::id), &bufTable_);
         prog_.setArg(kProbe_, 2, sizeof(uint32_t), &minLen);
@@ -204,7 +211,7 @@ private:
         uint32_t cap = kOutCap;
         prog_.setArg(kProbe_, 5, sizeof(uint32_t), &cap);
 
-        if (!prog_.run1D(kProbe_, global, 0, &err_)) return false;
+        if (!prog_.run1D(kProbe_, global, local, &err_)) return false;
         if (!prog_.finish()) return false;
 
         if (outHits) {
@@ -273,7 +280,59 @@ int GpuBackend::selfTest(const GpuDevice& hw) {
                   << "  cpu=" << cpuAddr << "  gpu=" << gpuAddr << "\n";
         if (!match) ++fails;
     }
-    std::cout << (fails ? std::to_string(fails) + " 个不一致\n" : "GPU secp256k1/keccak/base58 与 CPU 完全一致\n");
+    std::cout << (fails ? std::to_string(fails) + " 个不一致\n"
+                        : "test_pub: GPU secp256k1/keccak/base58 与 CPU 完全一致\n");
+
+    // ---- Montgomery 批量求逆：对照 libsecp256k1（其自带模逆 = 逐点单独求逆基准）----
+    const uint32_t ecw = 7;
+    std::vector<unsigned char> ct = genTable(c, ecw);
+    std::cout << "\ntest_mont (ECW=" << ecw << ", 批量求逆 vs 逐点求逆):\n";
+    for (uint32_t N : {2u, 4u, 8u, 16u, 32u}) {
+        ocl::Program pm;
+        std::string opts = "-D KPI=1 -D ECW=" + std::to_string(ecw) +
+                           " -D ECBITS=" + std::to_string(kEcBits) +
+                           " -D MONT_N=" + std::to_string(N);
+        if (!pm.build(hw.platformId, hw.deviceId, kGpuKernelSource, opts, &err)) {
+            std::cout << "  N=" << N << " 编译失败:\n" << err << "\n"; ++fails; continue;
+        }
+        ocl::id km = pm.kernel("test_mont", &err);
+        if (!km) { std::cout << "  N=" << N << ": " << err << "\n"; ++fails; continue; }
+
+        uint32_t cnt = 8 * N;                       // 多个 work-group
+        std::vector<uint32_t> sc(cnt);
+        for (uint32_t i = 0; i < cnt; ++i) sc[i] = (i * 2654435761u) & ((1u << kEcBits) - 1);
+        std::vector<unsigned char> po(cnt * 64, 0);
+
+        ocl::id mT = pm.buffer(ocl::MEM_READ_ONLY | ocl::MEM_COPY_HOST_PTR, ct.size(), ct.data(), &err);
+        ocl::id mP = pm.buffer(ocl::MEM_READ_ONLY | ocl::MEM_COPY_HOST_PTR, 64, p0, &err);
+        ocl::id mS = pm.buffer(ocl::MEM_READ_ONLY | ocl::MEM_COPY_HOST_PTR, cnt * 4, sc.data(), &err);
+        ocl::id mO = pm.buffer(ocl::MEM_WRITE_ONLY, cnt * 64, nullptr, &err);
+        pm.setArg(km, 0, sizeof(ocl::id), &mP);
+        pm.setArg(km, 1, sizeof(ocl::id), &mT);
+        pm.setArg(km, 2, sizeof(ocl::id), &mS);
+        pm.setArg(km, 3, sizeof(ocl::id), &mO);
+        pm.setArg(km, 4, sizeof(uint32_t), &cnt);
+        if (!pm.run1D(km, cnt, N, &err)) { std::cout << "  N=" << N << " run: " << err << "\n"; ++fails; continue; }
+        pm.finish();
+        pm.read(mO, cnt * 64, po.data());
+
+        int bad = 0;
+        for (uint32_t i = 0; i < cnt; ++i) {
+            unsigned char k[32];
+            std::memcpy(k, k0, 32);
+            unsigned char tw[32];
+            scalarBE(sc[i], tw);
+            unsigned char cpuPub[64];
+            if (!(secp256k1_ec_seckey_tweak_add(c, k, tw) && pubXY(c, k, cpuPub)) ||
+                std::memcmp(cpuPub, &po[i * 64], 64) != 0)
+                ++bad;
+        }
+        std::cout << "  N=" << N << " : " << (bad ? std::to_string(bad) + " / " + std::to_string(cnt) + " 不一致"
+                                                  : std::to_string(cnt) + " 个全部一致") << "\n";
+        if (bad) ++fails;
+    }
+
+    std::cout << (fails ? "\n有不一致，GPU 结果不可信\n" : "\n全部通过\n");
     return fails ? 1 : 0;
 }
 
@@ -287,6 +346,7 @@ int gpuSelfTest(const GpuDevice& dev) { return GpuBackend::selfTest(dev); }
 
 void gpuSetKeysPerItem(uint32_t n) { if (n) g_keysPerItem = n; }
 void gpuSetEcWindow(uint32_t w) { if (w >= 1 && w <= 8) g_ecWindow = w; }
+void gpuSetMontN(uint32_t n) { if (n >= 1 && n <= 64) g_montN = n; }
 
 // --profile：逐阶段消融，估算内核各阶段占比
 int gpuProfile(const GpuDevice& dev, double secs) {
@@ -391,7 +451,7 @@ int gpuBench(const GpuDevice& dev, double secs) {
     std::cout << "\n每档预热 " << secs << "s + 计时 " << secs
               << "s（集成显卡持续负载会降频，取稳态值）\n";
 
-    uint32_t savedKpi = g_keysPerItem, savedEcw = g_ecWindow;
+    uint32_t savedKpi = g_keysPerItem, savedEcw = g_ecWindow, savedMont = g_montN;
 
     std::cout << "\n== 固定基点 EC 窗口法扫描（KPI=1，min_len=20）==\n";
     std::cout << "  ECW=1 逐bit(baseline)；ECW=w 用 comb 表，点加从 ~10 降到 ceil(20/w)\n";
@@ -415,9 +475,28 @@ int gpuBench(const GpuDevice& dev, double secs) {
     }
     std::printf("  最优 ECW=%u  (%.0f keys/s)\n", bestEcw, bestR);
 
-    std::cout << "\n== keys-per-item 扫描 (ECW=" << bestEcw << ") ==\n";
+    std::cout << "\n== Montgomery 批量求逆扫描 (ECW=" << bestEcw << ", 1 WI=1 私钥) ==\n";
     g_ecWindow = bestEcw;
-    for (uint32_t n : {1u, 2u, 4u, 8u, 16u}) {
+    g_keysPerItem = 1;
+    double montBase = 0, bestMontR = 0;
+    uint32_t bestMont = 1;
+    for (uint32_t nn : {1u, 2u, 4u, 8u, 16u, 32u}) {
+        g_montN = nn;
+        GpuBackend b(dev);
+        if (!b.available()) { std::cout << "  N=" << nn << " 构建失败\n"; continue; }
+        b.benchN(secs, 20);
+        double r = b.benchN(secs, 20);
+        if (nn == 1) montBase = r;
+        std::printf("  N=%-3u : %10.0f keys/s   %+5.0f%%%s\n", nn, r,
+                    montBase > 0 ? (r - montBase) / montBase * 100 : 0,
+                    r > bestMontR ? "  <-" : "");
+        if (r > bestMontR) { bestMontR = r; bestMont = nn; }
+    }
+    std::printf("  最优 MONT_N=%u  (%.0f keys/s)\n", bestMont, bestMontR);
+
+    std::cout << "\n== keys-per-item 扫描 (ECW=" << bestEcw << ", MONT_N=1) ==\n";
+    g_montN = 1;
+    for (uint32_t n : {1u, 2u, 4u, 8u}) {
         g_keysPerItem = n;
         GpuBackend b(dev);
         if (!b.available()) continue;
@@ -425,6 +504,7 @@ int gpuBench(const GpuDevice& dev, double secs) {
         double r = b.benchN(secs, 20);
         std::printf("  N=%-3u : %10.0f keys/s\n", n, r);
     }
+    g_keysPerItem = 1;
 
     std::cout << "\n== 尾号规则对吞吐的影响 (ECW=" << bestEcw << ", N=1) ==\n";
     g_keysPerItem = 1;
@@ -438,5 +518,6 @@ int gpuBench(const GpuDevice& dev, double secs) {
 
     g_keysPerItem = savedKpi;
     g_ecWindow = savedEcw;
+    g_montN = savedMont;
     return 0;
 }

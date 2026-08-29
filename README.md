@@ -41,7 +41,7 @@ cmake --build build --config Release
 .\build\tron_vanity_generator.exe --selftest       # 用已知私钥校验地址算法
 .\build\tron_vanity_generator.exe --hashtest       # 校验 SHA-256 / Keccak-256
 .\build\tron_vanity_generator.exe --gputest        # GPU 内核逐项对照 CPU
-.\build\tron_vanity_generator.exe --bench 4         # 扫 keys-per-item + 规则吞吐
+.\build\tron_vanity_generator.exe --bench 4         # 扫 ECW / MONT_N / KPI + 规则吞吐
 .\build\tron_vanity_generator.exe --profile 4       # 内核逐阶段耗时占比
 ```
 
@@ -106,22 +106,41 @@ profile 随之变化（UHD 730，ECW=7）：
 | Keccak / SHA / Base58 / 匹配 | ~7% | ~10% |
 | 合计 | 1961 ns/key (508K) | **1227 ns/key (815K)** |
 
-→ 现在瓶颈是**模逆**（55%）。下一步：Montgomery 批量求逆——把数据布局改成
-「1 work-item = 1 scalar / 1 Jacobian point」，work-group 内 N 个 Z 坐标做前缀积 →
-**一次** field inverse → 后缀恢复 → N 个 affine point（避免单 work-item 同时持有 N 份 EC 状态）。
+→ ECW=7 后瓶颈是**模逆**（55%）。
+
+**Montgomery 批量求逆** `--mont-n N`（已实现，默认关）：数据布局按「1 work-item = 1 私钥 =
+1 Jacobian 点」，work-group 内 N 个 Z 坐标 → `lid==0` 做前缀积 + **一次** `fe_inv` + 后缀恢复
+→ N 个 `z⁻¹` → 各 WI 转仿射。`--gputest` 对照 libsecp256k1 验证 N=2/4/8/16/32 全部一致。
+
+**但 UHD 730 实测收益 ≈ 0**（`--bench`）：
+
+| MONT_N | keys/s | vs N=1 |
+| --- | --- | --- |
+| 1（每 WI 各自求逆） | ~800–826K | — |
+| 2 | ~128K | **−84%** |
+| 4 / 8 | ~250K / ~468K | −69% / −42% |
+| 16 | ~842K | +5%（噪声级）|
+| 32 | ~763K | −5% |
+
+原因：`lid==0` 串行做整个 `fe_inv`（~255 次平方的长依赖链），其余 N−1 个 lane 卡在 barrier；
+小 N 时这个停顿吃掉一切，大 N 才勉强摊平。而 N=1 时每个 lane 各自求逆本来就**完全并行**
+（SIMT 用几千个 work-item 掩盖单次求逆的延迟）——Montgomery 把「多个并行求逆」换成
+「一次串行求逆 + 停顿」，在这种海量并行的场景是亏的。这正是「理论复杂度↓ → occupancy↓ →
+实际变慢」的典型案例。`--mont-n` 保留给占用特性不同的其它 GPU。
 
 实测（本机 i5-12400 + Intel UHD 730，稳态）：
 
-| 版本 | CPU | GPU | 倍数 |
+| 版本 | CPU | GPU (60s 实跑) | 倍数 |
 | --- | --- | --- | --- |
 | `v0.1-gpu-baseline` | ~305K | ~500K | 1.7× |
-| `v0.2` 固定基点窗口法（当前） | ~305K | **~785K**（60s 实跑） | **2.6×** |
+| `v0.2` 固定基点窗口法 | ~305K | ~785K | 2.6× |
+| `v0.3`（当前，含 Montgomery 但默认关） | ~300K | **~820K** | **2.7×** |
 
-`auto` 选 GPU。尾号规则对吞吐几乎无影响。`--keys-per-item` 在 UHD 730 上 N=1 最快
-（每私钥仍需一次模逆，N>1 只增加寄存器压力）；换 GPU 用 `--bench` 重新找 ECW / N 甜点位。
+`auto` 选 GPU。尾号规则对吞吐无影响。`--keys-per-item` / `--mont-n` 在 UHD 730 上都是 N=1 最快
+（见上）；换 GPU 用 `--bench` 重新找 ECW / KPI / MONT_N 甜点位。
 
-后续：**Montgomery 批量求逆**（当前 55% 的头）→ register/occupancy 调优 → EC×Inversion 组合矩阵。
-不再碰已是个位数占比的 SHA / Keccak / Base58。
+500K → 820K 的提升**全部来自固定基点窗口法**；Montgomery 在这块 iGPU 上没帮助。
+更强的独显可能是另一套最优参数——`--bench` 会自己告诉你。
 
 ## 安全提示
 
