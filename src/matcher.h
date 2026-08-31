@@ -29,21 +29,21 @@ inline int trailingRepeatLen(const std::string& a) {
     return len;
 }
 
-// 结尾「连续号码/字母」的长度：按字符本身的 ASCII 值 ±1 递增或递减，
+// 结尾「连续号码/字母」的长度：只认**升序**——按字符 ASCII 值每位 +1，
 // 且整段必须落在同一类别内（全数字 / 全小写 / 全大写）。
-// 例：12345、abcde、WXYZ、54321、edcba 命中；
-//     89123（跨过缺失的 0）、xyzabc（z→a 回绕）、9abc（数字跨字母）、FGHJ（跳过缺失的 I）不命中。
+// 例：12345、abcde、WXYZ 命中；
+//     54321、edcba（降序）、89123（跨过缺失的 0）、xyzab（z→a 回绕）、
+//     9abc（数字跨字母）、FGHJ（跳过缺失的 I）不命中。
 inline int trailingSequenceLen(const std::string& a) {
     int n = static_cast<int>(a.size());
     if (n < 2) return n;
     int cls = charClass(a[n - 1]);
     if (cls == 0 || charClass(a[n - 2]) != cls) return 1;
-    int step = static_cast<int>(a[n - 1]) - static_cast<int>(a[n - 2]);
-    if (step != 1 && step != -1) return 1;
+    if (static_cast<int>(a[n - 1]) - static_cast<int>(a[n - 2]) != 1) return 1;   // 必须升序
     int len = 2;
     for (int i = n - 3; i >= 0; --i) {
         if (charClass(a[i]) != cls) break;
-        if (static_cast<int>(a[i + 1]) - static_cast<int>(a[i]) != step) break;
+        if (static_cast<int>(a[i + 1]) - static_cast<int>(a[i]) != 1) break;
         ++len;
     }
     return len;

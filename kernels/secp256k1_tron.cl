@@ -15,7 +15,7 @@
  *   h   = keccak256(pub);  payload = 0x41 || h[12:32]
  *   full= payload || sha256d(payload)[0:4]              (25 字节)
  *   取 full 的低位若干个 base58 字符（地址结尾），判定 相同/连续 >= min_len
- *   连续 = 字符 ASCII ±1 且同类别（全数字/全小写/全大写）
+ *   连续 = 只认升序（每位 ASCII +1）且同类别（全数字/全小写/全大写）
  *   命中则 atomic 写回 s
  */
 
@@ -593,22 +593,20 @@ inline void base58_tail(uchar *tc, const uchar *full25) {
 }
 
 /* 返回结尾「相同」或「连续」尾段的最大长度。
- * 连续 = 按字符 ASCII 值 ±1，且整段同一类别（全数字/全小写/全大写）。*/
+ * 连续 = 只认升序：每位 ASCII +1，且整段同一类别（全数字/全小写/全大写）。
+ * tc[0] 是地址最末字符，所以升序要求 tc[0] = tc[1] + 1。*/
 inline int tail_match_len(const uchar *tc) {
     int rep = 1;
     for (int i = 1; i < TAIL; i++) { if (tc[i] == tc[0]) rep++; else break; }
 
     int seq = 1;
     int cls = char_class(tc[0]);
-    if (cls != 0 && char_class(tc[1]) == cls) {
-        int step = (int)tc[0] - (int)tc[1];
-        if (step == 1 || step == -1) {
-            seq = 2;
-            for (int i = 2; i < TAIL; i++) {
-                if (char_class(tc[i]) != cls) break;
-                if ((int)tc[i - 1] - (int)tc[i] != step) break;
-                seq++;
-            }
+    if (cls != 0 && char_class(tc[1]) == cls && (int)tc[0] - (int)tc[1] == 1) {
+        seq = 2;
+        for (int i = 2; i < TAIL; i++) {
+            if (char_class(tc[i]) != cls) break;
+            if ((int)tc[i - 1] - (int)tc[i] != 1) break;
+            seq++;
         }
     }
     return rep > seq ? rep : seq;

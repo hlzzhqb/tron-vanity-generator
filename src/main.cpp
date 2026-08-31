@@ -60,8 +60,8 @@ void printUsage() {
         "TRON 靓号地址生成器 (CPU + 集成显卡自动检测)\n"
         "规则: 地址结尾满足下列任一即命中并保存:\n"
         "  - >=N 位相同字符, 如 AAAAA\n"
-        "  - >=N 位连续字符(按 ASCII ±1, 且同类别: 全数字/全小写/全大写), 如 12345 / abcde / WXYZ / edcba\n"
-        "    不含: 89123(跨缺失的0) xyzab(z->a回绕) 9abcd(数字跨字母) FGHJ(跳过缺失的I)\n\n"
+        "  - >=N 位连续字符(只认升序: 每位 ASCII +1, 且同类别: 全数字/全小写/全大写), 如 12345 / abcde / WXYZ\n"
+        "    不含: 54321(降序) 89123(跨缺失的0) xyzab(z->a回绕) 9abcd(数字跨字母) FGHJ(跳过缺失的I)\n\n"
         "用法: tron_vanity_generator [选项]\n"
         "  --min N          最小匹配位数，默认 5\n"
         "  --threads N      CPU 线程数，默认=逻辑核心数\n"
@@ -184,15 +184,18 @@ int matchtest() {
         {"TxxxxxxxxxxxxxxxxxxxxxxxxxxAAAAA", 5, true,  "相同"},
         {"Txxxxxxxxxxxxxxxxxxxxxxxxxx12345", 5, true,  "连续"},
         {"Txxxxxxxxxxxxxxxxxxxxxxxxxxabcde", 5, true,  "连续"},
-        {"Txxxxxxxxxxxxxxxxxxxxxxxxxxedcba", 5, true,  "连续"},
+        {"Txxxxxxxxxxxxxxxxxxxxxxxxxxvwxyz", 5, true,  "连续"},
+        {"Txxxxxxxxxxxxxxxxxxxxxxxxxxdefgh", 5, true,  "连续"},
+        {"TxxxxxxxxxxxxxxxxxxxxxxxxxxABCDE", 5, true,  "连续"},
+        {"TxxxxxxxxxxxxxxxxxxxxxxxxxxxWXYZ", 4, true,  "连续"},
+        {"Txxxxxxxxxxxxxxxxxxxxxxxxxx54321", 5, false, ""},      // 降序（只认升序）
+        {"Txxxxxxxxxxxxxxxxxxxxxxxxxxedcba", 5, false, ""},      // 降序
+        {"TxxxxxxxxxxxxxxxxxxxxxxxxxxZYXWV", 5, false, ""},      // 降序
         {"TxxxxxxxxxxxxxxxxxxxxxxxxxxWXYZ1", 5, false, ""},      // 大写跨到数字
         {"Txxxxxxxxxxxxxxxxxxxxxxxxxx89123", 5, false, ""},      // 跨过缺失的 0
-        {"Txxxxxxxxxxxxxxxxxxxxxxxxxxvwxyz", 5, true,  "连续"},
         {"Txxxxxxxxxxxxxxxxxxxxxxxxxxxyzab", 5, false, ""},      // z→a 回绕
         {"Txxxxxxxxxxxxxxxxxxxxxxxxxx9abcd", 5, false, ""},      // 数字跨字母
         {"TxxxxxxxxxxxxxxxxxxxxxxxxxxxFGHJ", 5, false, ""},      // 跳过缺失的 I（大写）
-        {"Txxxxxxxxxxxxxxxxxxxxxxxxxxdefgh", 5, true,  "连续"},
-        {"TxxxxxxxxxxxxxxxxxxxxxxxxxxABCDE", 5, true,  "连续"},
         {"Txxxxxxxxxxxxxxxxxxxxxxxxxxaaaa5", 5, false, ""},      // 只有 4 位相同
     };
     int fails = 0;
