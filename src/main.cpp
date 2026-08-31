@@ -58,7 +58,10 @@ struct Options {
 void printUsage() {
     std::cout <<
         "TRON 靓号地址生成器 (CPU + 集成显卡自动检测)\n"
-        "规则: 地址结尾 >=N 位相同字符(AAAAA) 或 >=N 位连续号码(12345/54321) 即命中并保存。\n\n"
+        "规则: 地址结尾满足下列任一即命中并保存:\n"
+        "  - >=N 位相同字符, 如 AAAAA\n"
+        "  - >=N 位连续字符(按 ASCII ±1, 且同类别: 全数字/全小写/全大写), 如 12345 / abcde / WXYZ / edcba\n"
+        "    不含: 89123(跨缺失的0) xyzab(z->a回绕) 9abcd(数字跨字母) FGHJ(跳过缺失的I)\n\n"
         "用法: tron_vanity_generator [选项]\n"
         "  --min N          最小匹配位数，默认 5\n"
         "  --threads N      CPU 线程数，默认=逻辑核心数\n"
@@ -74,7 +77,7 @@ void printUsage() {
         "  --bench [秒]     GPU 压测：扫 keys-per-item 甜点位 + 各尾号规则吞吐\n"
         "  --profile [秒]   GPU 内核逐阶段耗时占比\n"
         "  --gputest        GPU 内核逐项对照 CPU\n"
-        "  --selftest / --hashtest   地址算法 / 哈希 自检\n"
+        "  --selftest / --hashtest / --matchtest   地址算法 / 哈希 / 命中规则 自检\n"
         "  --help           显示本帮助\n";
 }
 
@@ -174,6 +177,39 @@ int selftest() {
 }
 
 int hashtest();
+
+int matchtest() {
+    struct Case { const char* addr; int minLen; bool wantMatch; const char* wantKind; };
+    const Case cases[] = {
+        {"TxxxxxxxxxxxxxxxxxxxxxxxxxxAAAAA", 5, true,  "相同"},
+        {"Txxxxxxxxxxxxxxxxxxxxxxxxxx12345", 5, true,  "连续"},
+        {"Txxxxxxxxxxxxxxxxxxxxxxxxxxabcde", 5, true,  "连续"},
+        {"Txxxxxxxxxxxxxxxxxxxxxxxxxxedcba", 5, true,  "连续"},
+        {"TxxxxxxxxxxxxxxxxxxxxxxxxxxWXYZ1", 5, false, ""},      // 大写跨到数字
+        {"Txxxxxxxxxxxxxxxxxxxxxxxxxx89123", 5, false, ""},      // 跨过缺失的 0
+        {"Txxxxxxxxxxxxxxxxxxxxxxxxxxvwxyz", 5, true,  "连续"},
+        {"Txxxxxxxxxxxxxxxxxxxxxxxxxxxyzab", 5, false, ""},      // z→a 回绕
+        {"Txxxxxxxxxxxxxxxxxxxxxxxxxx9abcd", 5, false, ""},      // 数字跨字母
+        {"TxxxxxxxxxxxxxxxxxxxxxxxxxxxFGHJ", 5, false, ""},      // 跳过缺失的 I（大写）
+        {"Txxxxxxxxxxxxxxxxxxxxxxxxxxdefgh", 5, true,  "连续"},
+        {"TxxxxxxxxxxxxxxxxxxxxxxxxxxABCDE", 5, true,  "连续"},
+        {"Txxxxxxxxxxxxxxxxxxxxxxxxxxaaaa5", 5, false, ""},      // 只有 4 位相同
+    };
+    int fails = 0;
+    for (const auto& c : cases) {
+        std::string a = c.addr;
+        MatchResult r = evaluateAddress(a, c.minLen);
+        bool ok = (r.matched == c.wantMatch) &&
+                  (!c.wantMatch || std::string(r.kind) == c.wantKind);
+        std::cout << (ok ? "  OK   " : "  FAIL ") << "..." << a.substr(a.size() - 6)
+                  << "  -> matched=" << r.matched << " kind=" << (r.matched ? r.kind : "-")
+                  << " len=" << r.runLen << "\n";
+        if (!ok) ++fails;
+    }
+    std::cout << (fails ? std::to_string(fails) + " 个失败\n" : "MATCHTEST OK\n");
+    return fails ? 1 : 0;
+}
+
 int gpuSelfTest(const GpuDevice& dev);
 int gpuBench(const GpuDevice& dev, double secs);
 int gpuProfile(const GpuDevice& dev, double secs);
@@ -187,6 +223,7 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--selftest") return selftest();
         if (a == "--hashtest") return hashtest();
+        if (a == "--matchtest") return matchtest();
         if (a == "--gputest") {
             HardwareReport hw = detectHardware();
             if (hw.gpus.empty()) { std::cerr << "无 GPU: " << hw.openclNote << "\n"; return 1; }
@@ -306,10 +343,14 @@ int main(int argc, char** argv) {
     std::cout << "最小位数 : " << opt.minLen << "\n"
               << "输出文件 : " << opt.output << "\n"
               << "尝试上限 : " << (opt.maxAttempts ? groupThousands(opt.maxAttempts) : "无限") << "\n";
-    if (etaSec > 0)
-        std::cout << "预计每命中一个约需 " << (etaSec < 90 ? std::to_string((long)etaSec) + " 秒"
-                     : etaSec < 5400 ? std::to_string((long)(etaSec / 60)) + " 分钟"
-                     : std::to_string((long)(etaSec / 3600)) + " 小时") << "\n";
+    if (etaSec > 0) {
+        std::string eta = etaSec < 1     ? "不到 1 秒"
+                        : etaSec < 90    ? std::to_string((long)(etaSec + 0.5)) + " 秒"
+                        : etaSec < 5400  ? std::to_string((long)(etaSec / 60 + 0.5)) + " 分钟"
+                        : etaSec < 172800 ? std::to_string((long)(etaSec / 3600 + 0.5)) + " 小时"
+                        : std::to_string((long)(etaSec / 86400 + 0.5)) + " 天";
+        std::cout << "预计每命中一个约需 " << eta << "（粗略估计）\n";
+    }
     std::cout << "运行中，每 10 秒报告一次进度。按 Ctrl+C 停止。\n\n";
 
     FileSink sink(opt.output);

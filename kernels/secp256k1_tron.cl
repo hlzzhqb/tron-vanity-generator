@@ -14,7 +14,8 @@
  *   pub = X(Q)||Y(Q)  (BE)
  *   h   = keccak256(pub);  payload = 0x41 || h[12:32]
  *   full= payload || sha256d(payload)[0:4]              (25 字节)
- *   取 full 的低位 8 个 base58 字符（地址结尾），判定 相同/连续 >= min_len
+ *   取 full 的低位若干个 base58 字符（地址结尾），判定 相同/连续 >= min_len
+ *   连续 = 字符 ASCII ±1 且同类别（全数字/全小写/全大写）
  *   命中则 atomic 写回 s
  */
 
@@ -563,9 +564,21 @@ inline void sha256_short(uchar *out, const uchar *msg, int len) {
 
 #define TAIL 12
 
-/* full[25] 大端；取地址最后 TAIL 个字符的 base58 位置(0..57)，tp[0] = 最末字符。
- * 直接输出位置，省去字符转换与逆查表：位置相等 <=> 字符相等，位置差 <=> base58 连续。 */
-inline void base58_tail_pos(uchar *tp, const uchar *full25) {
+__constant char B58[58] = {
+    '1','2','3','4','5','6','7','8','9',
+    'A','B','C','D','E','F','G','H','J','K','L','M','N','P','Q','R','S','T','U','V','W','X','Y','Z',
+    'a','b','c','d','e','f','g','h','i','j','k','m','n','o','p','q','r','s','t','u','v','w','x','y','z' };
+
+/* 字符类别：1=数字 2=小写 3=大写 0=其它（与 src/matcher.h 一致）*/
+inline int char_class(uchar c) {
+    if (c >= '0' && c <= '9') return 1;
+    if (c >= 'a' && c <= 'z') return 2;
+    if (c >= 'A' && c <= 'Z') return 3;
+    return 0;
+}
+
+/* full[25] 大端；取地址最后 TAIL 个 base58 字符，tc[0] = 最末字符。 */
+inline void base58_tail(uchar *tc, const uchar *full25) {
     uchar num[25];
     for (int i = 0; i < 25; i++) num[i] = full25[i];
     for (int it = 0; it < TAIL; it++) {
@@ -575,22 +588,27 @@ inline void base58_tail_pos(uchar *tp, const uchar *full25) {
             num[i] = acc / 58;
             rem = acc % 58;
         }
-        tp[it] = (uchar)rem;
+        tc[it] = B58[rem];
     }
 }
 
-/* tp = 位置数组，tp[0] 为地址最末字符。返回 相同/连续 尾段的最大长度。 */
-inline int tail_match_len(const uchar *tp) {
+/* 返回结尾「相同」或「连续」尾段的最大长度。
+ * 连续 = 按字符 ASCII 值 ±1，且整段同一类别（全数字/全小写/全大写）。*/
+inline int tail_match_len(const uchar *tc) {
     int rep = 1;
-    for (int i = 1; i < TAIL; i++) { if (tp[i] == tp[0]) rep++; else break; }
+    for (int i = 1; i < TAIL; i++) { if (tc[i] == tc[0]) rep++; else break; }
 
     int seq = 1;
-    int d = (int)tp[0] - (int)tp[1];
-    if (d == 1 || d == -1) {
-        seq = 2;
-        for (int i = 2; i < TAIL; i++) {
-            if ((int)tp[i-1] - (int)tp[i] != d) break;
-            seq++;
+    int cls = char_class(tc[0]);
+    if (cls != 0 && char_class(tc[1]) == cls) {
+        int step = (int)tc[0] - (int)tc[1];
+        if (step == 1 || step == -1) {
+            seq = 2;
+            for (int i = 2; i < TAIL; i++) {
+                if (char_class(tc[i]) != cls) break;
+                if ((int)tc[i - 1] - (int)tc[i] != step) break;
+                seq++;
+            }
         }
     }
     return rep > seq ? rep : seq;
@@ -611,7 +629,7 @@ inline void pub_to_tail(const uchar *pub, uchar *tp) {
     uchar full[25];
     for (int i = 0; i < 21; i++) full[i] = payload[i];
     for (int i = 0; i < 4; i++) full[21 + i] = d2[i];
-    base58_tail_pos(tp, full);
+    base58_tail(tp, full);
 }
 
 inline void emit_if_match(const uchar *pub, uint s, uint min_len,
@@ -775,7 +793,7 @@ __kernel void prof(__global const uchar *P0_b32,
         uchar full[25];
         for (int k = 0; k < 21; k++) full[k] = payload[k];
         for (int k = 0; k < 4; k++) full[21+k] = d2[k];
-        uchar tp[TAIL]; base58_tail_pos(tp, full); sv ^= tp[0];
+        uchar tp[TAIL]; base58_tail(tp, full); sv ^= tp[0];
 #endif
 #if PROF_STAGE >= 6
         sv ^= (uint)tail_match_len(tp);

@@ -12,9 +12,12 @@ struct MatchResult {
     std::string tail;
 };
 
-inline int base58Pos(char c) {
-    const char* p = std::strchr(kBase58, c);
-    return p ? static_cast<int>(p - kBase58) : -1;
+// 字符类别：1=数字 2=小写 3=大写 0=其它
+inline int charClass(char c) {
+    if (c >= '0' && c <= '9') return 1;
+    if (c >= 'a' && c <= 'z') return 2;
+    if (c >= 'A' && c <= 'Z') return 3;
+    return 0;
 }
 
 // 结尾相同字符的连续长度
@@ -26,19 +29,21 @@ inline int trailingRepeatLen(const std::string& a) {
     return len;
 }
 
-// 结尾按 base58 表递增/递减的连续号码长度 (如 12345 / 54321)
+// 结尾「连续号码/字母」的长度：按字符本身的 ASCII 值 ±1 递增或递减，
+// 且整段必须落在同一类别内（全数字 / 全小写 / 全大写）。
+// 例：12345、abcde、WXYZ、54321、edcba 命中；
+//     89123（跨过缺失的 0）、xyzabc（z→a 回绕）、9abc（数字跨字母）、FGHJ（跳过缺失的 I）不命中。
 inline int trailingSequenceLen(const std::string& a) {
     int n = static_cast<int>(a.size());
     if (n < 2) return n;
-    int p1 = base58Pos(a[n - 1]);
-    int p0 = base58Pos(a[n - 2]);
-    if (p0 < 0 || p1 < 0 || std::abs(p1 - p0) != 1) return 1;
-    int step = p1 - p0;
+    int cls = charClass(a[n - 1]);
+    if (cls == 0 || charClass(a[n - 2]) != cls) return 1;
+    int step = static_cast<int>(a[n - 1]) - static_cast<int>(a[n - 2]);
+    if (step != 1 && step != -1) return 1;
     int len = 2;
     for (int i = n - 3; i >= 0; --i) {
-        int cur = base58Pos(a[i]);
-        int nxt = base58Pos(a[i + 1]);
-        if (cur < 0 || nxt < 0 || nxt - cur != step) break;
+        if (charClass(a[i]) != cls) break;
+        if (static_cast<int>(a[i + 1]) - static_cast<int>(a[i]) != step) break;
         ++len;
     }
     return len;
