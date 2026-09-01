@@ -1,5 +1,35 @@
 # TRON Vanity Generator
 
+High-performance TRON (TRX) vanity address generator for Windows.
+
+- CPU multi-threaded generation (libsecp256k1)
+- Intel / AMD **OpenCL GPU** backend — secp256k1 + Keccak-256 + SHA-256 + Base58 + suffix matching all in-kernel
+- Automatic hardware detection, automatic CPU/GPU benchmark and **fastest-backend selection**
+- Suffix matching: repeated characters (`AAAAA`) and ascending sequences (`12345`, `abcde`, `WXYZ`)
+- GPU ↔ CPU cross-validation (`--gputest`), rule self-check (`--matchtest`)
+- No OpenSSL. Single self-contained `.exe` (static runtime), only needs a GPU driver's `OpenCL.dll` for the GPU path
+
+Key generation uses the OS CSPRNG (`BCryptGenRandom`) and libsecp256k1 for elliptic-curve operations.
+
+## Quick Start
+
+```powershell
+git clone --recurse-submodules https://github.com/hlzzhqb/tron-vanity-generator.git
+cd tron-vanity-generator
+powershell -ExecutionPolicy Bypass -File build.ps1
+
+.\build\tron_vanity_generator.exe --selftest
+.\build\tron_vanity_generator.exe --gputest
+.\build\tron_vanity_generator.exe               # auto-select backend, run until Ctrl+C
+```
+
+Or grab `tron_vanity_generator.exe` from [Releases](https://github.com/hlzzhqb/tron-vanity-generator/releases) — no build, no VC++ runtime needed.
+
+> ⚠️ Private keys of matches are written **in plaintext** to `tron_vanity_matches.txt` (gitignored).
+> Never commit or upload result files. Move funds off generated addresses promptly.
+
+---
+
 CPU + Intel/AMD 集成显卡自动检测、按算力自动选择后端，Windows 本机运行的 TRON 靓号地址生成器。
 
 命中规则：Base58 地址**结尾**满足以下任一条件即写入结果文件：
@@ -11,14 +41,6 @@ CPU + Intel/AMD 集成显卡自动检测、按算力自动选择后端，Windows
     `xyzab`（`z→a` 回绕）、`9abcd`（数字跨到字母）、`FGHJ`（跳过 base58 里没有的 `I`）
 
 `N` 由 `--min` 指定，默认 5。位数更多的匹配优先记录。`--matchtest` 可自检规则。
-
-## 获取源码
-
-```powershell
-git clone --recurse-submodules https://github.com/hlzzhqb/tron-vanity-generator.git
-```
-
-（已经 clone 但漏了子模块：`git submodule update --init --recursive`）
 
 ## 构建（Windows，Visual Studio / Build Tools）
 
@@ -152,13 +174,16 @@ profile 随之变化（UHD 730，ECW=7）：
 「一次串行求逆 + 停顿」，在这种海量并行的场景是亏的。这正是「理论复杂度↓ → occupancy↓ →
 实际变慢」的典型案例。`--mont-n` 保留给占用特性不同的其它 GPU。
 
-实测（本机 i5-12400 + Intel UHD 730，稳态）：
+实测（**单一样本**：i5-12400 + Intel UHD 730，稳态）：
 
-| 版本 | CPU | GPU (60s 实跑) | 倍数 |
+| 阶段 | CPU | GPU (60s 实跑) | 倍数 |
 | --- | --- | --- | --- |
-| `v0.1-gpu-baseline` | ~305K | ~500K | 1.7× |
-| `v0.2` 固定基点窗口法 | ~305K | ~785K | 2.6× |
-| `v0.3`（当前，含 Montgomery 但默认关） | ~300K | **~820K** | **2.7×** |
+| baseline | ~305K | ~500K | 1.7× |
+| + 固定基点窗口法 | ~305K | ~785K | 2.6× |
+| + Montgomery（默认关，此卡无收益） | ~300K | **~820K** | **2.7×** |
+
+> 吞吐随 GPU 型号 / 驱动 / OpenCL 实现 / 运行参数差异很大，UHD 730 也不保证普遍能到 820K/s。
+> **换硬件请自己跑 `--bench`** 找 ECW / KPI / MONT_N 甜点位。
 
 `auto` 选 GPU。尾号规则对吞吐无影响。`--keys-per-item` / `--mont-n` 在 UHD 730 上都是 N=1 最快
 （见上）；换 GPU 用 `--bench` 重新找 ECW / KPI / MONT_N 甜点位。

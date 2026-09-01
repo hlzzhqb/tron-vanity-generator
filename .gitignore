@@ -1,2 +1,23 @@
+# Build output
 build/
+out/
+cmake-build-*/
+
+# Generated private keys / match results — NEVER commit these
 tron_vanity_matches*.txt
+*_matches.txt
+*.key
+*.pem
+
+# Local config / secrets
+.env
+*.secret
+
+# IDE
+.vs/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
