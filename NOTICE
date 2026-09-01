@@ -1,0 +1,3 @@
+
+libsecp256k1 (bundled as the third_party/secp256k1 submodule) is also under
+the MIT License; see third_party/secp256k1/COPYING.
