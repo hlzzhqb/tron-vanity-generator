@@ -12,7 +12,15 @@ CPU + Intel/AMD 集成显卡自动检测、按算力自动选择后端，Windows
 
 `N` 由 `--min` 指定，默认 5。位数更多的匹配优先记录。`--matchtest` 可自检规则。
 
-## 构建（已安装的 VS2026 生成工具）
+## 获取源码
+
+```powershell
+git clone --recurse-submodules https://github.com/hlzzhqb/tron-vanity-generator.git
+```
+
+（已经 clone 但漏了子模块：`git submodule update --init --recursive`）
+
+## 构建（Windows，Visual Studio / Build Tools）
 
 无需手动打开“开发者命令提示符”，普通 PowerShell 即可：
 
@@ -20,13 +28,13 @@ CPU + Intel/AMD 集成显卡自动检测、按算力自动选择后端，Windows
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-脚本会：定位 VS → 若缺 `third_party/secp256k1` 则自动 `git clone` →
+脚本会：定位 VS → 拉取 `third_party/secp256k1` 子模块 →
 用 VS 自带的 CMake + Ninja 配置并编译 → 产物 `build\tron_vanity_generator.exe`。
 
-依赖全部**随源码自带或自动获取**：
-- `third_party/secp256k1`（bitcoin-core/libsecp256k1，`build.ps1` 自动克隆）
-- SHA-256 已内置（`src/crypto.cpp`），随机数用 Windows `BCryptGenRandom`
-- 无需 OpenSSL
+依赖：
+- `third_party/secp256k1`（bitcoin-core/libsecp256k1，git 子模块，MIT）
+- SHA-256 / Keccak-256 已内置（`src/`），随机数用 Windows `BCryptGenRandom`
+- 无需 OpenSSL。GPU 用运行期动态加载的 `OpenCL.dll`（显卡驱动自带）
 
 ## 复制到另一台机器运行
 
@@ -160,5 +168,11 @@ profile 随之变化（UHD 730，ECW=7）：
 
 ## 安全提示
 
-- 私钥以明文十六进制写入结果文件，请妥善保管，生成后尽快转移资产。
-- 请在可信、无恶意软件的机器上运行。
+- 私钥以明文十六进制写入结果文件（`tron_vanity_matches.txt`，已在 `.gitignore` 中），
+  请妥善保管，生成后尽快转移资产。
+- 随机数用操作系统 CSPRNG（`BCryptGenRandom`）+ libsecp256k1，无自造弱随机。
+- 请在可信、无恶意软件的机器上运行。审阅代码后自行编译最稳妥。
+
+## License
+
+[MIT](LICENSE) © 2026 Huang Qingbiao。子模块 `third_party/secp256k1` 亦为 MIT。

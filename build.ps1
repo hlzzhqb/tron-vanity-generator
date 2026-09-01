@@ -12,8 +12,12 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $root
 
 if (-not (Test-Path "$root\third_party\secp256k1\CMakeLists.txt")) {
-    Write-Host "Cloning libsecp256k1 ..."
-    git clone --depth 1 https://github.com/bitcoin-core/secp256k1.git "$root\third_party\secp256k1"
+    Write-Host "Fetching libsecp256k1 submodule ..."
+    if (Test-Path "$root\.git") {
+        git -C $root submodule update --init --recursive
+    } else {
+        git clone --depth 1 https://github.com/bitcoin-core/secp256k1.git "$root\third_party\secp256k1"
+    }
 }
 
 # --- locate Visual Studio ---
