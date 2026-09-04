@@ -17,8 +17,14 @@
 
 namespace {
 
-constexpr uint32_t kBatch = 1u << 20;   // 每次内核启动扫描的连续私钥数
-constexpr uint32_t kEcBits = 20;        // = log2(kBatch)，固定基点标量乘的有效位数
+// 每次内核启动扫描的连续私钥数。原来是 2^20：在 UHD 730 上单次 GPU kernel 会连续跑
+// ~1.3 秒不间断——集成显卡同时还要管显示合成(DWM)，长时间几乎满载跑这种单次超过 1 秒的
+// 大批次，被观察到会导致显示子系统卡死到需要硬重启（个别机器/驱动组合下 WDDM 抢占不够
+// 及时）。缩到 2^16 后单次 kernel 只跑几十毫秒，两次启动之间 GPU 有机会正常服务显示。
+// 对吞吐影响可忽略（host<->device 开销本来就在 profile 里测出接近 0）。
+constexpr uint32_t kBatch = 1u << 16;
+constexpr uint32_t kEcBits = 20;        // 固定基点标量乘覆盖的位数；> log2(kBatch) 也没问题，
+                                        // 只是表里高位窗口永远用不到，不影响正确性
 constexpr uint32_t kOutCap = 8192;      // 单批命中回传上限
 
 // 每个 work-item 连续处理多少私钥。UHD 730 上实测 N=1 最快（寄存器压力 + 每个私钥仍需一次
